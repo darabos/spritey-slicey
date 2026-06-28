@@ -62,6 +62,12 @@ type SelectedCell = {
   column: number
 }
 
+type CellNamesClipboard = {
+  sourceRows: number
+  sourceColumns: number
+  cellNames: Record<string, string>
+}
+
 const imageModules = import.meta.glob('../images/*.png', {
   eager: true,
   import: 'default',
@@ -226,6 +232,7 @@ function App() {
   const [selectedCell, setSelectedCell] = useState<SelectedCell | null>(null)
   const [importMessage, setImportMessage] = useState('')
   const [isHydrated, setIsHydrated] = useState(false)
+  const [nameClipboard, setNameClipboard] = useState<CellNamesClipboard | null>(null)
   const importInputRef = useRef<HTMLInputElement | null>(null)
   const cellNameInputRef = useRef<HTMLInputElement | null>(null)
 
@@ -616,6 +623,62 @@ function App() {
     }
   }
 
+  const handleCopyCellNames = () => {
+    const copiedNames = { ...activeConfig.cellNames }
+    setNameClipboard({
+      sourceRows: activeConfig.rows,
+      sourceColumns: activeConfig.columns,
+      cellNames: copiedNames,
+    })
+    setImportMessage(
+      `Copied ${Object.keys(copiedNames).length} cell name(s) from this sheet.`,
+    )
+  }
+
+  const handlePasteCellNames = () => {
+    if (!activeImageId) {
+      return
+    }
+
+    if (!nameClipboard) {
+      setImportMessage('Clipboard is empty. Copy names from another sheet first.')
+      return
+    }
+
+    let keptCount = 0
+    updateConfig(activeImageId, (previous) => {
+      const nextNames: Record<string, string> = {}
+
+      for (const [key, value] of Object.entries(nameClipboard.cellNames)) {
+        const parsed = parseCellKey(key)
+        if (!parsed) {
+          continue
+        }
+        if (parsed.row >= previous.rows || parsed.column >= previous.columns) {
+          continue
+        }
+
+        nextNames[key] = value
+        keptCount += 1
+      }
+
+      return {
+        ...previous,
+        cellNames: nextNames,
+      }
+    })
+
+    const sourceLabel = `${nameClipboard.sourceColumns}x${nameClipboard.sourceRows}`
+    const targetLabel = `${activeConfig.columns}x${activeConfig.rows}`
+    if (sourceLabel === targetLabel) {
+      setImportMessage(`Pasted ${keptCount} cell name(s).`)
+    } else {
+      setImportMessage(
+        `Pasted ${keptCount} cell name(s) with size remap (${sourceLabel} -> ${targetLabel}).`,
+      )
+    }
+  }
+
   return (
     <div className="layout">
       <aside className="sidebar">
@@ -694,6 +757,12 @@ function App() {
         )}
 
         <div className="button-row">
+          <button type="button" className="import-btn" onClick={handleCopyCellNames}>
+            Copy Names
+          </button>
+          <button type="button" className="import-btn" onClick={handlePasteCellNames}>
+            Paste Names
+          </button>
           <button
             type="button"
             className="import-btn"

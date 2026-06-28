@@ -168,7 +168,6 @@
   overflow: hidden;
   border: 1px solid var(--panel-border);
   background: var(--image-bg);
-  flex: 1;
   min-height: 16rem;
   user-select: none;
 }
