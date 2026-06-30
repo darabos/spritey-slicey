@@ -347,6 +347,21 @@ function App() {
     () => sheets.find((sheet) => sheet.id === activeSheetId) ?? null,
     [activeSheetId, sheets],
   )
+  const sortedSheets = useMemo(
+    () =>
+      [...sheets].sort((left, right) => {
+        const byDisplayName = left.displayName.localeCompare(right.displayName, undefined, {
+          sensitivity: 'base',
+          numeric: true,
+        })
+        if (byDisplayName !== 0) {
+          return byDisplayName
+        }
+
+        return left.createdAt - right.createdAt
+      }),
+    [sheets],
+  )
 
   const activeConfig = activeSheet?.grid ?? createDefaultGridConfig()
   const activeThreshold = activeSheet
@@ -1178,7 +1193,7 @@ function App() {
         {infoMessage ? <p className="import-message">{infoMessage}</p> : null}
 
         <ul className="image-list">
-          {sheets.map((sheet) => {
+          {sortedSheets.map((sheet) => {
             const isActive = sheet.id === activeSheetId
             const stage = workerStageBySheetId[sheet.id]
             return (
