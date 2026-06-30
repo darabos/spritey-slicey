@@ -29,6 +29,12 @@ const DEFAULT_WHITE_BG_THRESHOLD = 70
 const MIN_WHITE_BG_THRESHOLD = 0
 const MAX_WHITE_BG_THRESHOLD = 255
 const THRESHOLD_STORAGE_KEY = 'sprite-cutter-thresholds-v1'
+const EXPORT_SCALE_ENABLED_STORAGE_KEY = 'sprite-cutter-export-scale-enabled-v1'
+const EXPORT_HEIGHT_STORAGE_KEY = 'sprite-cutter-export-height-v1'
+const DEFAULT_EXPORT_SCALE_ENABLED = true
+const DEFAULT_EXPORT_HEIGHT = 1600
+const MIN_EXPORT_HEIGHT = 1
+const MAX_EXPORT_HEIGHT = 10000
 
 type Axis = 'horizontal' | 'vertical'
 
@@ -87,6 +93,41 @@ function loadThresholdMap(): ThresholdMap {
     return next
   } catch {
     return {}
+  }
+}
+
+function sanitizeExportHeight(value: unknown): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) {
+    return DEFAULT_EXPORT_HEIGHT
+  }
+
+  return Math.max(MIN_EXPORT_HEIGHT, Math.min(MAX_EXPORT_HEIGHT, Math.round(parsed)))
+}
+
+function loadExportScaleEnabled(): boolean {
+  try {
+    const serialized = localStorage.getItem(EXPORT_SCALE_ENABLED_STORAGE_KEY)
+    if (serialized === null) {
+      return DEFAULT_EXPORT_SCALE_ENABLED
+    }
+
+    return serialized === 'true'
+  } catch {
+    return DEFAULT_EXPORT_SCALE_ENABLED
+  }
+}
+
+function loadExportHeight(): number {
+  try {
+    const serialized = localStorage.getItem(EXPORT_HEIGHT_STORAGE_KEY)
+    if (!serialized) {
+      return DEFAULT_EXPORT_HEIGHT
+    }
+
+    return sanitizeExportHeight(serialized)
+  } catch {
+    return DEFAULT_EXPORT_HEIGHT
   }
 }
 
@@ -280,6 +321,12 @@ function App() {
   const [nameClipboard, setNameClipboard] = useState<CellNamesClipboard | null>(null)
   const [isHydrated, setIsHydrated] = useState(false)
   const [isExporting, setIsExporting] = useState(false)
+  const [isExportScalingEnabled, setIsExportScalingEnabled] = useState(() =>
+    loadExportScaleEnabled(),
+  )
+  const [exportHeight, setExportHeight] = useState(() =>
+    loadExportHeight(),
+  )
   const [thresholdBySheetId, setThresholdBySheetId] = useState<ThresholdMap>(() =>
     loadThresholdMap(),
   )
@@ -418,6 +465,25 @@ function App() {
       // Ignore localStorage write failures; processing still works in memory.
     }
   }, [thresholdBySheetId])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        EXPORT_SCALE_ENABLED_STORAGE_KEY,
+        String(isExportScalingEnabled),
+      )
+    } catch {
+      // Ignore localStorage write failures; export still works in memory.
+    }
+  }, [isExportScalingEnabled])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(EXPORT_HEIGHT_STORAGE_KEY, String(exportHeight))
+    } catch {
+      // Ignore localStorage write failures; export still works in memory.
+    }
+  }, [exportHeight])
 
   useEffect(() => {
     const timersBySheetId = thresholdDebounceTimerBySheetIdRef.current
@@ -886,7 +952,10 @@ function App() {
     setIsExporting(true)
 
     try {
-      await exportSheetsAsZip(sheets)
+      await exportSheetsAsZip(sheets, {
+        scaleEnabled: isExportScalingEnabled,
+        targetHeight: sanitizeExportHeight(exportHeight),
+      })
       setInfoMessage('ZIP exported successfully.')
     } catch (error) {
       const message = error instanceof Error ? error.message : 'ZIP export failed.'
@@ -947,6 +1016,32 @@ function App() {
               onChange={(event) => handleThresholdChange(Number(event.target.value))}
             />
             <span className="threshold-value">{activeThreshold}</span>
+          </div>
+        </label>
+
+        <label className="field" htmlFor="export-height-input">
+          Export Vertical Resolution
+          <div className="scale-row">
+            <label className="scale-toggle" htmlFor="export-scale-enabled-input">
+              <input
+                id="export-scale-enabled-input"
+                type="checkbox"
+                checked={isExportScalingEnabled}
+                onChange={(event) => setIsExportScalingEnabled(event.target.checked)}
+              />
+              Scale
+            </label>
+            <input
+              id="export-height-input"
+              type="number"
+              min={MIN_EXPORT_HEIGHT}
+              max={MAX_EXPORT_HEIGHT}
+              value={exportHeight}
+              disabled={!isExportScalingEnabled}
+              onChange={(event) =>
+                setExportHeight(sanitizeExportHeight(Number(event.target.value) || exportHeight))
+              }
+            />
           </div>
         </label>
 

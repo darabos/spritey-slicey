@@ -115,6 +115,35 @@
   font-size: 0.83rem;
 }
 
+.scale-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.55rem;
+  align-items: center;
+}
+
+.scale-row input[type='number'] {
+  min-width: 0;
+}
+
+.scale-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--ink);
+  font-size: 0.85rem;
+}
+
+.field .scale-toggle input[type='checkbox'] {
+  border: 1px solid var(--panel-border);
+  background: var(--panel-input);
+  border-radius: 0.3rem;
+  padding: 0;
+  width: 1rem;
+  height: 1rem;
+  accent-color: var(--line-highlight);
+}
+
 button:disabled {
   opacity: 0.56;
   cursor: not-allowed;

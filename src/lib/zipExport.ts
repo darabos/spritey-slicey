@@ -2,6 +2,11 @@ import JSZip from 'jszip'
 import { blobToImageBitmap, cropCanvasToBlob, resizeBitmapToHeight } from './cropResize'
 import type { SheetRecord } from './types'
 
+type ExportZipOptions = {
+  scaleEnabled: boolean
+  targetHeight: number
+}
+
 function parseCellKey(key: string): { row: number; column: number } | null {
   const [rowPart, columnPart] = key.split(':')
   const row = Number(rowPart)
@@ -34,7 +39,10 @@ function buildStops(length: number, ratios: number[]): number[] {
   return [0, ...ratios.map((stop) => Math.round(length * stop)), length]
 }
 
-export async function exportSheetsAsZip(sheets: SheetRecord[]): Promise<void> {
+export async function exportSheetsAsZip(
+  sheets: SheetRecord[],
+  options: ExportZipOptions,
+): Promise<void> {
   const zip = new JSZip()
   const filenameCounts = new Map<string, number>()
   let exportedCount = 0
@@ -44,7 +52,9 @@ export async function exportSheetsAsZip(sheets: SheetRecord[]): Promise<void> {
     const image = await blobToImageBitmap(sourceBlob)
 
     try {
-      const resized = await resizeBitmapToHeight(image, 1600)
+      const resized = options.scaleEnabled
+        ? await resizeBitmapToHeight(image, options.targetHeight)
+        : await resizeBitmapToHeight(image, image.height)
       const width = resized.width
       const height = resized.height
 
