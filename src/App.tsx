@@ -632,27 +632,22 @@ function App() {
         (processingVersionBySheetIdRef.current[sheetId] ?? 0) + 1
       processingVersionBySheetIdRef.current[sheetId] = nextVersion
 
-      let processingMeta: SheetMeta | null = null
       setSheets((previous) =>
         previous.map((sheet) => {
           if (sheet.id !== sheetId) {
             return sheet
           }
 
+          dirtySheetIdsRef.current.add(sheet.id)
           const nextSheet: SheetRecord = {
             ...sheet,
             updatedAt: Date.now(),
             status: 'processing',
             errorMessage: null,
           }
-          processingMeta = toSheetMeta(nextSheet)
           return nextSheet
         }),
       )
-
-      if (processingMeta) {
-        await putSheetMeta(processingMeta)
-      }
 
       try {
         const processed = await preprocessImage(originalBlob, normalizedThreshold, (stage) => {
@@ -670,13 +665,13 @@ function App() {
           return false
         }
 
-        let readyMeta: SheetMeta | null = null
         setSheets((previous) =>
           previous.map((sheet) => {
             if (sheet.id !== sheetId) {
               return sheet
             }
 
+            dirtySheetIdsRef.current.add(sheet.id)
             const nextSheet: SheetRecord = {
               ...sheet,
               updatedAt: Date.now(),
@@ -692,17 +687,11 @@ function App() {
               },
             }
 
-            readyMeta = toSheetMeta(nextSheet)
             return nextSheet
           }),
         )
 
-        if (readyMeta) {
-          await Promise.all([
-            putSheetMeta(readyMeta),
-            putSheetBlobs(sheetId, originalBlob, processed.blob),
-          ])
-        }
+        await putSheetBlobs(sheetId, originalBlob, processed.blob)
 
         return true
       } catch (error) {
@@ -711,27 +700,22 @@ function App() {
         }
 
         const message = error instanceof Error ? error.message : 'Background removal failed'
-        let errorMeta: SheetMeta | null = null
         setSheets((previous) =>
           previous.map((sheet) => {
             if (sheet.id !== sheetId) {
               return sheet
             }
 
+            dirtySheetIdsRef.current.add(sheet.id)
             const nextSheet: SheetRecord = {
               ...sheet,
               updatedAt: Date.now(),
               status: 'error',
               errorMessage: message,
             }
-            errorMeta = toSheetMeta(nextSheet)
             return nextSheet
           }),
         )
-
-        if (errorMeta) {
-          await putSheetMeta(errorMeta)
-        }
 
         return false
       } finally {
