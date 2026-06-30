@@ -1,4 +1,4 @@
-# Sprite Cutter (Frontend-Only)
+# Spritey Slicey
 
 Sprite sheet cutter running fully in the browser.
 

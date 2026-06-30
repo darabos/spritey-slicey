@@ -953,39 +953,41 @@ function App() {
     <div className="layout">
       <aside className="sidebar">
         <div className="sidebar-head">
-          <h1>Sprite Cutter</h1>
-          <p>Upload sheets, define cells, and export ZIP. All data stays in your browser.</p>
+          <h1>Spritey Slicey</h1>
+          <p>Splits sprite sheets into individual images. All data stays in your browser.</p>
         </div>
 
-        <label className="field" htmlFor="columns-input">
-          Columns
-          <input
-            id="columns-input"
-            type="number"
-            min={1}
-            max={30}
-            value={activeConfig.columns}
-            disabled={!activeSheet}
-            onChange={(event) =>
-              handleColumnsChange(Math.max(1, Math.min(30, Number(event.target.value) || 1)))
-            }
-          />
-        </label>
+        <div className="grid-size-row">
+          <label className="field" htmlFor="columns-input">
+            Columns
+            <input
+              id="columns-input"
+              type="number"
+              min={1}
+              max={30}
+              value={activeConfig.columns}
+              disabled={!activeSheet}
+              onChange={(event) =>
+                handleColumnsChange(Math.max(1, Math.min(30, Number(event.target.value) || 1)))
+              }
+            />
+          </label>
 
-        <label className="field" htmlFor="rows-input">
-          Rows
-          <input
-            id="rows-input"
-            type="number"
-            min={1}
-            max={30}
-            value={activeConfig.rows}
-            disabled={!activeSheet}
-            onChange={(event) =>
-              handleRowsChange(Math.max(1, Math.min(30, Number(event.target.value) || 1)))
-            }
-          />
-        </label>
+          <label className="field" htmlFor="rows-input">
+            Rows
+            <input
+              id="rows-input"
+              type="number"
+              min={1}
+              max={30}
+              value={activeConfig.rows}
+              disabled={!activeSheet}
+              onChange={(event) =>
+                handleRowsChange(Math.max(1, Math.min(30, Number(event.target.value) || 1)))
+              }
+            />
+          </label>
+        </div>
 
         <label className="field" htmlFor="threshold-input">
           Background Threshold
@@ -1148,6 +1150,8 @@ function App() {
             )
           })}
         </ul>
+        <p className="cell-helper">The first word of each sheet is used as the character name.</p>
+        <p className="cell-helper">Source code: <a href="https://github.com/darabos/spritey-slicey">https://github.com/darabos/spritey-slicey</a></p>
       </aside>
 
       <main className="editor">
