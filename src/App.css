@@ -95,6 +95,26 @@
   gap: 0.5rem;
 }
 
+.threshold-row {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.threshold-row input[type='range'] {
+  flex: 1;
+  accent-color: var(--line-highlight);
+  padding: 0;
+}
+
+.threshold-value {
+  min-width: 2.25rem;
+  text-align: right;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 0.83rem;
+}
+
 button:disabled {
   opacity: 0.56;
   cursor: not-allowed;

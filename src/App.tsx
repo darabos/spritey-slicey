@@ -25,7 +25,10 @@ import {
 } from './lib/types'
 import { exportSheetsAsZip } from './lib/zipExport'
 
-const WHITE_BG_THRESHOLD = 70
+const DEFAULT_WHITE_BG_THRESHOLD = 70
+const MIN_WHITE_BG_THRESHOLD = 0
+const MAX_WHITE_BG_THRESHOLD = 255
+const THRESHOLD_STORAGE_KEY = 'sprite-cutter-thresholds-v1'
 
 type Axis = 'horizontal' | 'vertical'
 
@@ -50,6 +53,41 @@ type WorkerStage = 'decode' | 'floodfill' | 'dilate' | 'alpha'
 type UploadSummary = {
   succeeded: number
   failed: number
+}
+
+type ThresholdMap = Record<string, number>
+
+function sanitizeThreshold(value: unknown): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) {
+    return DEFAULT_WHITE_BG_THRESHOLD
+  }
+
+  return Math.max(
+    MIN_WHITE_BG_THRESHOLD,
+    Math.min(MAX_WHITE_BG_THRESHOLD, Math.round(parsed)),
+  )
+}
+
+function loadThresholdMap(): ThresholdMap {
+  try {
+    const serialized = localStorage.getItem(THRESHOLD_STORAGE_KEY)
+    if (!serialized) {
+      return {}
+    }
+    const parsed = JSON.parse(serialized) as unknown
+    if (!parsed || typeof parsed !== 'object') {
+      return {}
+    }
+
+    const next: ThresholdMap = {}
+    for (const [sheetId, threshold] of Object.entries(parsed)) {
+      next[sheetId] = sanitizeThreshold(threshold)
+    }
+    return next
+  } catch {
+    return {}
+  }
 }
 
 function toSheetMeta(sheet: SheetRecord): SheetMeta {
@@ -242,6 +280,9 @@ function App() {
   const [nameClipboard, setNameClipboard] = useState<CellNamesClipboard | null>(null)
   const [isHydrated, setIsHydrated] = useState(false)
   const [isExporting, setIsExporting] = useState(false)
+  const [thresholdBySheetId, setThresholdBySheetId] = useState<ThresholdMap>(() =>
+    loadThresholdMap(),
+  )
   const [workerStageBySheetId, setWorkerStageBySheetId] = useState<Record<string, WorkerStage>>(
     {},
   )
@@ -249,6 +290,8 @@ function App() {
   const uploadInputRef = useRef<HTMLInputElement | null>(null)
   const cellNameInputRef = useRef<HTMLInputElement | null>(null)
   const dirtySheetIdsRef = useRef<Set<string>>(new Set())
+  const processingVersionBySheetIdRef = useRef<Record<string, number>>({})
+  const thresholdDebounceTimerBySheetIdRef = useRef<Record<string, number>>({})
 
   const activeSheet = useMemo(
     () => sheets.find((sheet) => sheet.id === activeSheetId) ?? null,
@@ -256,6 +299,9 @@ function App() {
   )
 
   const activeConfig = activeSheet?.grid ?? createDefaultGridConfig()
+  const activeThreshold = activeSheet
+    ? thresholdBySheetId[activeSheet.id] ?? DEFAULT_WHITE_BG_THRESHOLD
+    : DEFAULT_WHITE_BG_THRESHOLD
 
   const activeBlob = activeSheet
     ? activeSheet.processedBlob ?? activeSheet.originalBlob
@@ -364,6 +410,23 @@ function App() {
       setInfoMessage('Some changes were not persisted to browser storage.')
     })
   }, [sheets, isHydrated])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(THRESHOLD_STORAGE_KEY, JSON.stringify(thresholdBySheetId))
+    } catch {
+      // Ignore localStorage write failures; processing still works in memory.
+    }
+  }, [thresholdBySheetId])
+
+  useEffect(() => {
+    const timersBySheetId = thresholdDebounceTimerBySheetIdRef.current
+    return () => {
+      for (const timerId of Object.values(timersBySheetId)) {
+        window.clearTimeout(timerId)
+      }
+    }
+  }, [])
 
   useEffect(() => {
     if (!dragState || !activeSheetId) {
@@ -496,9 +559,132 @@ function App() {
     [updateActiveSheet],
   )
 
-  const runUploadPipeline = useCallback(async (files: File[]): Promise<UploadSummary> => {
+  const processSheetWithThreshold = useCallback(
+    async (sheetId: string, originalBlob: Blob, threshold: number): Promise<boolean> => {
+      const normalizedThreshold = sanitizeThreshold(threshold)
+      const nextVersion =
+        (processingVersionBySheetIdRef.current[sheetId] ?? 0) + 1
+      processingVersionBySheetIdRef.current[sheetId] = nextVersion
+
+      let processingMeta: SheetMeta | null = null
+      setSheets((previous) =>
+        previous.map((sheet) => {
+          if (sheet.id !== sheetId) {
+            return sheet
+          }
+
+          const nextSheet: SheetRecord = {
+            ...sheet,
+            updatedAt: Date.now(),
+            status: 'processing',
+            errorMessage: null,
+          }
+          processingMeta = toSheetMeta(nextSheet)
+          return nextSheet
+        }),
+      )
+
+      if (processingMeta) {
+        await putSheetMeta(processingMeta)
+      }
+
+      try {
+        const processed = await preprocessImage(originalBlob, normalizedThreshold, (stage) => {
+          if (processingVersionBySheetIdRef.current[sheetId] !== nextVersion) {
+            return
+          }
+
+          setWorkerStageBySheetId((previous) => ({
+            ...previous,
+            [sheetId]: stage,
+          }))
+        })
+
+        if (processingVersionBySheetIdRef.current[sheetId] !== nextVersion) {
+          return false
+        }
+
+        let readyMeta: SheetMeta | null = null
+        setSheets((previous) =>
+          previous.map((sheet) => {
+            if (sheet.id !== sheetId) {
+              return sheet
+            }
+
+            const nextSheet: SheetRecord = {
+              ...sheet,
+              updatedAt: Date.now(),
+              status: 'ready',
+              errorMessage: null,
+              processedBlob: processed.blob,
+              grid: {
+                ...sheet.grid,
+                dimensions: {
+                  width: processed.width,
+                  height: processed.height,
+                },
+              },
+            }
+
+            readyMeta = toSheetMeta(nextSheet)
+            return nextSheet
+          }),
+        )
+
+        if (readyMeta) {
+          await Promise.all([
+            putSheetMeta(readyMeta),
+            putSheetBlobs(sheetId, originalBlob, processed.blob),
+          ])
+        }
+
+        return true
+      } catch (error) {
+        if (processingVersionBySheetIdRef.current[sheetId] !== nextVersion) {
+          return false
+        }
+
+        const message = error instanceof Error ? error.message : 'Background removal failed'
+        let errorMeta: SheetMeta | null = null
+        setSheets((previous) =>
+          previous.map((sheet) => {
+            if (sheet.id !== sheetId) {
+              return sheet
+            }
+
+            const nextSheet: SheetRecord = {
+              ...sheet,
+              updatedAt: Date.now(),
+              status: 'error',
+              errorMessage: message,
+            }
+            errorMeta = toSheetMeta(nextSheet)
+            return nextSheet
+          }),
+        )
+
+        if (errorMeta) {
+          await putSheetMeta(errorMeta)
+        }
+
+        return false
+      } finally {
+        if (processingVersionBySheetIdRef.current[sheetId] === nextVersion) {
+          setWorkerStageBySheetId((previous) => {
+            const next = { ...previous }
+            delete next[sheetId]
+            return next
+          })
+        }
+      }
+    },
+    [],
+  )
+
+  const runUploadPipeline = useCallback(async (files: File[], threshold: number): Promise<UploadSummary> => {
     let succeeded = 0
     let failed = 0
+    const normalizedThreshold = sanitizeThreshold(threshold)
 
     const tasks = files.map(async (file, index) => {
       const now = Date.now() + index
@@ -517,6 +703,10 @@ function App() {
       }
 
       setSheets((previous) => [...previous, initialSheet])
+      setThresholdBySheetId((previous) => ({
+        ...previous,
+        [id]: normalizedThreshold,
+      }))
       setActiveSheetIdState((current) => current ?? id)
 
       await Promise.all([
@@ -524,92 +714,42 @@ function App() {
         putSheetBlobs(id, file, null),
       ])
 
-      try {
-        const processed = await preprocessImage(file, WHITE_BG_THRESHOLD, (stage) => {
-          setWorkerStageBySheetId((previous) => ({ ...previous, [id]: stage }))
-        })
-
-        setSheets((previous) =>
-          previous.map((sheet) => {
-            if (sheet.id !== id) {
-              return sheet
-            }
-
-            return {
-              ...sheet,
-              updatedAt: Date.now(),
-              status: 'ready',
-              errorMessage: null,
-              processedBlob: processed.blob,
-              grid: {
-                ...sheet.grid,
-                dimensions: {
-                  width: processed.width,
-                  height: processed.height,
-                },
-              },
-            }
-          }),
-        )
-
-        const updatedMeta: SheetMeta = {
-          ...toSheetMeta(initialSheet),
-          updatedAt: Date.now(),
-          status: 'ready',
-          errorMessage: null,
-          grid: {
-            ...initialSheet.grid,
-            dimensions: {
-              width: processed.width,
-              height: processed.height,
-            },
-          },
-        }
-
-        await Promise.all([
-          putSheetMeta(updatedMeta),
-          putSheetBlobs(id, file, processed.blob),
-        ])
-
+      const success = await processSheetWithThreshold(id, file, normalizedThreshold)
+      if (success) {
         succeeded += 1
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'Background removal failed'
-
-        setSheets((previous) =>
-          previous.map((sheet) => {
-            if (sheet.id !== id) {
-              return sheet
-            }
-
-            return {
-              ...sheet,
-              updatedAt: Date.now(),
-              status: 'error',
-              errorMessage: message,
-            }
-          }),
-        )
-
-        await putSheetMeta({
-          ...toSheetMeta(initialSheet),
-          updatedAt: Date.now(),
-          status: 'error',
-          errorMessage: message,
-        })
-
+      } else {
         failed += 1
-      } finally {
-        setWorkerStageBySheetId((previous) => {
-          const next = { ...previous }
-          delete next[id]
-          return next
-        })
       }
     })
 
     await Promise.all(tasks)
     return { succeeded, failed }
-  }, [])
+  }, [processSheetWithThreshold])
+
+  const handleThresholdChange = (nextValue: number) => {
+    if (!activeSheet) {
+      return
+    }
+
+    const threshold = sanitizeThreshold(nextValue)
+    const sheetId = activeSheet.id
+    setThresholdBySheetId((previous) => ({
+      ...previous,
+      [sheetId]: threshold,
+    }))
+
+    const existingTimerId = thresholdDebounceTimerBySheetIdRef.current[sheetId]
+    if (existingTimerId !== undefined) {
+      window.clearTimeout(existingTimerId)
+    }
+
+    const timerId = window.setTimeout(() => {
+      delete thresholdDebounceTimerBySheetIdRef.current[sheetId]
+      void processSheetWithThreshold(sheetId, activeSheet.originalBlob, threshold)
+    }, 240)
+
+    thresholdDebounceTimerBySheetIdRef.current[sheetId] = timerId
+  }
 
   const handleUploadFiles = async (event: ChangeEvent<HTMLInputElement>) => {
     const selectedFiles = event.target.files ? Array.from(event.target.files) : []
@@ -621,10 +761,16 @@ function App() {
       return
     }
 
-    setInfoMessage(`Uploading ${files.length} file(s). Background cleanup runs in a worker.`)
+    const inheritedThreshold = activeSheet
+      ? thresholdBySheetId[activeSheet.id] ?? DEFAULT_WHITE_BG_THRESHOLD
+      : DEFAULT_WHITE_BG_THRESHOLD
+
+    setInfoMessage(
+      `Uploading ${files.length} file(s). Background cleanup uses threshold ${inheritedThreshold}.`,
+    )
 
     try {
-      const summary = await runUploadPipeline(files)
+      const summary = await runUploadPipeline(files, inheritedThreshold)
       if (summary.failed === 0) {
         setInfoMessage(`Uploaded and processed ${summary.succeeded} file(s).`)
       } else {
@@ -710,6 +856,17 @@ function App() {
     setSheets((previous) => previous.filter((sheet) => sheet.id !== deletedId))
     setActiveSheetIdState(nextActiveId)
     setSelectedCell(null)
+    setThresholdBySheetId((previous) => {
+      const next = { ...previous }
+      delete next[deletedId]
+      return next
+    })
+
+    const existingTimerId = thresholdDebounceTimerBySheetIdRef.current[deletedId]
+    if (existingTimerId !== undefined) {
+      window.clearTimeout(existingTimerId)
+      delete thresholdDebounceTimerBySheetIdRef.current[deletedId]
+    }
 
     try {
       await deleteSheet(deletedId)
@@ -775,6 +932,22 @@ function App() {
               handleRowsChange(Math.max(1, Math.min(30, Number(event.target.value) || 1)))
             }
           />
+        </label>
+
+        <label className="field" htmlFor="threshold-input">
+          Background Threshold
+          <div className="threshold-row">
+            <input
+              id="threshold-input"
+              type="range"
+              min={MIN_WHITE_BG_THRESHOLD}
+              max={MAX_WHITE_BG_THRESHOLD}
+              value={activeThreshold}
+              disabled={!activeSheet}
+              onChange={(event) => handleThresholdChange(Number(event.target.value))}
+            />
+            <span className="threshold-value">{activeThreshold}</span>
+          </div>
         </label>
 
         {effectiveSelectedCell && activeSheet ? (
