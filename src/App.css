@@ -66,6 +66,18 @@
   cursor: pointer;
 }
 
+.danger-btn {
+  border: 1px solid color-mix(in srgb, #8f2e20 55%, var(--panel-border));
+  background: color-mix(in srgb, #8f2e20 18%, var(--panel-input));
+  color: var(--ink);
+  border-radius: 0.6rem;
+  padding: 0.58rem 0.7rem;
+  font-family: var(--heading);
+  font-size: 0.93rem;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+
 .import-btn {
   border: 1px solid var(--panel-border);
   background: var(--panel-input);
@@ -81,6 +93,11 @@
 .button-row {
   display: grid;
   gap: 0.5rem;
+}
+
+button:disabled {
+  opacity: 0.56;
+  cursor: not-allowed;
 }
 
 .file-input {
@@ -121,6 +138,10 @@
 }
 
 .image-tab {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 0.4rem;
   width: 100%;
   border: 1px solid var(--panel-border);
   background: var(--panel-input);
@@ -131,6 +152,13 @@
   text-align: left;
   cursor: pointer;
   font-family: var(--heading);
+}
+
+.image-tab small {
+  grid-column: 1 / -1;
+  color: var(--ink-soft);
+  font-size: 0.72rem;
+  margin-top: -0.1rem;
 }
 
 .image-tab.active {
@@ -160,6 +188,34 @@
   margin: 0.2rem 0 0;
   color: var(--ink-soft);
   font-size: 0.9rem;
+}
+
+.sheet-error {
+  color: #8f2e20;
+}
+
+.status-pill {
+  justify-self: end;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  padding: 0.1rem 0.42rem;
+  font-size: 0.7rem;
+  letter-spacing: 0.01em;
+}
+
+.status-pill.ready {
+  background: color-mix(in srgb, #1c8448 16%, var(--panel-input));
+  border-color: color-mix(in srgb, #1c8448 40%, transparent);
+}
+
+.status-pill.processing {
+  background: color-mix(in srgb, #1e5b94 18%, var(--panel-input));
+  border-color: color-mix(in srgb, #1e5b94 50%, transparent);
+}
+
+.status-pill.error {
+  background: color-mix(in srgb, #8f2e20 18%, var(--panel-input));
+  border-color: color-mix(in srgb, #8f2e20 50%, transparent);
 }
 
 .canvas-wrap {

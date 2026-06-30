@@ -1,75 +1,38 @@
-# React + TypeScript + Vite
+# Sprite Cutter (Frontend-Only)
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Sprite sheet cutter running fully in the browser.
 
-Currently, two official plugins are available:
+## What It Does
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- Upload one or more sprite sheet images directly in the UI.
+- Removes white background immediately after upload in a dedicated Web Worker.
+- Resizes each sheet to a fixed height to make it easy to work with sheets of different resolutions.
+- Stores sheets and grid setup data in IndexedDB (browser persistence, no backend).
+- Lets you define rows/columns, drag cut lines, and name cells.
+- Exports all named cells as one ZIP file.
 
-## React Compiler
+## Output ZIP Structure
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- One directory per character.
+- Character name is the first word of the sheet filename, lowercased.
+- Files are PNGs named as: `<character> <cellName>.png`.
+- If a filename collision occurs, a numeric suffix is added.
 
-## Expanding the ESLint configuration
+## Persistence
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+- Data is saved in IndexedDB stores for sheet metadata, blobs, and active sheet selection.
+- Refreshing/reopening the app restores uploaded sheets and grid edits.
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+## Development
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-
+```bash
+npm install
+npm run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## Validation
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-
+```bash
+npm run lint
+npm run build
 ```

@@ -8,53 +8,30 @@ import {
   type ChangeEvent,
 } from 'react'
 import './App.css'
+import {
+  deleteSheet,
+  getActiveSheetId,
+  listSheets,
+  putSheetBlobs,
+  putSheetMeta,
+  setActiveSheetId,
+} from './lib/indexedDb'
+import { preprocessImage } from './lib/imageProcessingClient'
+import type { GridConfig, SheetMeta, SheetRecord } from './lib/types'
+import {
+  createDefaultGridConfig,
+  createUniformStops,
+  MIN_GAP,
+} from './lib/types'
+import { exportSheetsAsZip } from './lib/zipExport'
 
-const DEFAULT_COLUMNS = 6
-const DEFAULT_ROWS = 4
-const MIN_GAP = 0.02
-const STORAGE_KEY = 'sprite-cutter-state-v1'
+const WHITE_BG_THRESHOLD = 70
 
 type Axis = 'horizontal' | 'vertical'
-
-type ImageEntry = {
-  id: string
-  filename: string
-  displayName: string
-  src: string
-}
-
-type ImageDimensions = {
-  width: number
-  height: number
-}
-
-type ImageGridConfig = {
-  columns: number
-  rows: number
-  horizontalLines: number[]
-  verticalLines: number[]
-  cellNames: Record<string, string>
-  dimensions: ImageDimensions | null
-}
 
 type DragState = {
   axis: Axis
   index: number
-}
-
-type PersistedState = {
-  activeImageId: string | null
-  configs: Record<
-    string,
-    {
-      columns?: unknown
-      rows?: unknown
-      horizontalLines?: unknown
-      verticalLines?: unknown
-      cellNames?: unknown
-      dimensions?: { width?: unknown; height?: unknown } | null
-    }
-  >
 }
 
 type SelectedCell = {
@@ -68,58 +45,24 @@ type CellNamesClipboard = {
   cellNames: Record<string, string>
 }
 
-const imageModules = import.meta.glob('../images/*.png', {
-  eager: true,
-  import: 'default',
-}) as Record<string, string>
+type WorkerStage = 'decode' | 'floodfill' | 'dilate' | 'alpha'
 
-function toImageId(filename: string): string {
-  return filename
-    .replace(/\.[^.]+$/, '')
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/(^-|-$)/g, '')
+type UploadSummary = {
+  succeeded: number
+  failed: number
 }
 
-function createUniformStops(cellCount: number): number[] {
-  if (cellCount <= 1) {
-    return []
-  }
-
-  return Array.from(
-    { length: cellCount - 1 },
-    (_, index) => (index + 1) / cellCount,
-  )
-}
-
-function createDefaultConfig(): ImageGridConfig {
+function toSheetMeta(sheet: SheetRecord): SheetMeta {
   return {
-    columns: DEFAULT_COLUMNS,
-    rows: DEFAULT_ROWS,
-    horizontalLines: createUniformStops(DEFAULT_ROWS),
-    verticalLines: createUniformStops(DEFAULT_COLUMNS),
-    cellNames: {},
-    dimensions: null,
+    id: sheet.id,
+    filename: sheet.filename,
+    displayName: sheet.displayName,
+    createdAt: sheet.createdAt,
+    updatedAt: sheet.updatedAt,
+    status: sheet.status,
+    errorMessage: sheet.errorMessage,
+    grid: sheet.grid,
   }
-}
-
-function round4(value: number): number {
-  return Math.round(value * 10000) / 10000
-}
-
-function clampLineValue(value: number, values: number[], index: number): number {
-  const minBoundary = index === 0 ? MIN_GAP : values[index - 1] + MIN_GAP
-  const maxBoundary =
-    index === values.length - 1 ? 1 - MIN_GAP : values[index + 1] - MIN_GAP
-
-  const bounded = Math.max(minBoundary, Math.min(maxBoundary, value))
-  return Number.isFinite(bounded) ? bounded : values[index]
-}
-
-function toCellKey(row: number, column: number): string {
-  return `${row}:${column}`
 }
 
 function parseCellKey(key: string): SelectedCell | null {
@@ -135,7 +78,95 @@ function parseCellKey(key: string): SelectedCell | null {
   return { row, column }
 }
 
-function getCellBounds(config: ImageGridConfig): Array<{
+function toCellKey(row: number, column: number): string {
+  return `${row}:${column}`
+}
+
+function clampLineValue(value: number, values: number[], index: number): number {
+  const minBoundary = index === 0 ? MIN_GAP : values[index - 1] + MIN_GAP
+  const maxBoundary =
+    index === values.length - 1 ? 1 - MIN_GAP : values[index + 1] - MIN_GAP
+
+  const bounded = Math.max(minBoundary, Math.min(maxBoundary, value))
+  return Number.isFinite(bounded) ? bounded : values[index]
+}
+
+function normalizeStops(rawValues: unknown, cellCount: number): number[] {
+  const expected = Math.max(0, cellCount - 1)
+  if (expected === 0) {
+    return []
+  }
+
+  if (!Array.isArray(rawValues)) {
+    return createUniformStops(cellCount)
+  }
+
+  const parsed = rawValues
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value))
+
+  if (parsed.length !== expected) {
+    return createUniformStops(cellCount)
+  }
+
+  parsed.sort((left, right) => left - right)
+
+  const adjusted: number[] = []
+  for (let index = 0; index < parsed.length; index += 1) {
+    const minBoundary = index === 0 ? MIN_GAP : adjusted[index - 1] + MIN_GAP
+    const maxBoundary = 1 - MIN_GAP * (parsed.length - index)
+    adjusted.push(Math.max(minBoundary, Math.min(parsed[index], maxBoundary)))
+  }
+
+  return adjusted
+}
+
+function sanitizeGrid(rawGrid: Partial<GridConfig>, fallback: GridConfig): GridConfig {
+  const columns = Math.max(1, Math.min(30, Number(rawGrid.columns) || fallback.columns))
+  const rows = Math.max(1, Math.min(30, Number(rawGrid.rows) || fallback.rows))
+
+  const width = Number(rawGrid.dimensions?.width)
+  const height = Number(rawGrid.dimensions?.height)
+  const nextCellNames: Record<string, string> = {}
+
+  if (rawGrid.cellNames && typeof rawGrid.cellNames === 'object') {
+    for (const [key, value] of Object.entries(rawGrid.cellNames)) {
+      const parsed = parseCellKey(key)
+      if (!parsed) {
+        continue
+      }
+      if (parsed.row >= rows || parsed.column >= columns) {
+        continue
+      }
+      if (typeof value !== 'string') {
+        continue
+      }
+      const trimmed = value.trim()
+      if (!trimmed) {
+        continue
+      }
+      nextCellNames[key] = trimmed
+    }
+  }
+
+  return {
+    columns,
+    rows,
+    horizontalLines: normalizeStops(rawGrid.horizontalLines, rows),
+    verticalLines: normalizeStops(rawGrid.verticalLines, columns),
+    cellNames: nextCellNames,
+    dimensions:
+      Number.isFinite(width) && Number.isFinite(height)
+        ? { width, height }
+        : fallback.dimensions,
+  }
+}
+
+function buildDisplayName(filename: string): string {
+  return filename.replace(/\.[^.]+$/, '')
+}
+
+function getCellBounds(config: GridConfig): Array<{
   row: number
   column: number
   left: number
@@ -177,204 +208,165 @@ function getCellBounds(config: ImageGridConfig): Array<{
   return cells
 }
 
-function normalizeStops(rawValues: unknown, cellCount: number): number[] {
-  const expected = Math.max(0, cellCount - 1)
-  if (expected === 0) {
-    return []
+function statusLabel(status: SheetRecord['status']): string {
+  if (status === 'processing') {
+    return 'Processing'
   }
-
-  if (!Array.isArray(rawValues)) {
-    return createUniformStops(cellCount)
+  if (status === 'error') {
+    return 'Error'
   }
+  return 'Ready'
+}
 
-  const parsed = rawValues
-    .map((value) => Number(value))
-    .filter((value) => Number.isFinite(value))
-
-  if (parsed.length !== expected) {
-    return createUniformStops(cellCount)
+function stageLabel(stage: WorkerStage): string {
+  switch (stage) {
+    case 'decode':
+      return 'Decoding image'
+    case 'floodfill':
+      return 'Flood filling background'
+    case 'dilate':
+      return 'Expanding mask'
+    case 'alpha':
+      return 'Applying alpha cleanup'
+    default:
+      return 'Processing'
   }
-
-  parsed.sort((left, right) => left - right)
-
-  const adjusted: number[] = []
-  for (let index = 0; index < parsed.length; index += 1) {
-    const minBoundary = index === 0 ? MIN_GAP : adjusted[index - 1] + MIN_GAP
-    const maxBoundary = 1 - MIN_GAP * (parsed.length - index)
-    adjusted.push(Math.max(minBoundary, Math.min(parsed[index], maxBoundary)))
-  }
-
-  return adjusted
 }
 
 function App() {
-  const images = useMemo<ImageEntry[]>(() => {
-    return Object.entries(imageModules)
-      .map(([rawPath, src]) => {
-        const filename = decodeURIComponent(rawPath.split('/').pop() ?? rawPath)
-        return {
-          id: toImageId(filename),
-          filename,
-          displayName: filename.replace(/\.[^.]+$/, ''),
-          src,
-        }
-      })
-      .sort((left, right) =>
-        left.displayName.localeCompare(right.displayName, 'hu-HU'),
-      )
-  }, [])
-
-  const [activeImageId, setActiveImageId] = useState<string | null>(
-    images[0]?.id ?? null,
-  )
-  const [configs, setConfigs] = useState<Record<string, ImageGridConfig>>({})
+  const [sheets, setSheets] = useState<SheetRecord[]>([])
+  const [activeSheetId, setActiveSheetIdState] = useState<string | null>(null)
   const [dragState, setDragState] = useState<DragState | null>(null)
   const [selectedCell, setSelectedCell] = useState<SelectedCell | null>(null)
-  const [importMessage, setImportMessage] = useState('')
-  const [isHydrated, setIsHydrated] = useState(false)
+  const [infoMessage, setInfoMessage] = useState('')
   const [nameClipboard, setNameClipboard] = useState<CellNamesClipboard | null>(null)
-  const importInputRef = useRef<HTMLInputElement | null>(null)
-  const cellNameInputRef = useRef<HTMLInputElement | null>(null)
-
-  const activeImage = useMemo(
-    () => images.find((image) => image.id === activeImageId) ?? null,
-    [activeImageId, images],
+  const [isHydrated, setIsHydrated] = useState(false)
+  const [isExporting, setIsExporting] = useState(false)
+  const [workerStageBySheetId, setWorkerStageBySheetId] = useState<Record<string, WorkerStage>>(
+    {},
   )
 
-  const activeConfig = activeImageId
-    ? configs[activeImageId] ?? createDefaultConfig()
-    : createDefaultConfig()
+  const uploadInputRef = useRef<HTMLInputElement | null>(null)
+  const cellNameInputRef = useRef<HTMLInputElement | null>(null)
+  const dirtySheetIdsRef = useRef<Set<string>>(new Set())
+
+  const activeSheet = useMemo(
+    () => sheets.find((sheet) => sheet.id === activeSheetId) ?? null,
+    [activeSheetId, sheets],
+  )
+
+  const activeConfig = activeSheet?.grid ?? createDefaultGridConfig()
+
+  const activeBlob = activeSheet
+    ? activeSheet.processedBlob ?? activeSheet.originalBlob
+    : null
+
+  const activeImageUrl = useMemo(() => {
+    if (!activeBlob) {
+      return null
+    }
+    return URL.createObjectURL(activeBlob)
+  }, [activeBlob])
+
+  useEffect(() => {
+    return () => {
+      if (activeImageUrl) {
+        URL.revokeObjectURL(activeImageUrl)
+      }
+    }
+  }, [activeImageUrl])
+
+  const effectiveSelectedCell =
+    selectedCell &&
+    selectedCell.row < activeConfig.rows &&
+    selectedCell.column < activeConfig.columns
+      ? selectedCell
+      : null
 
   const cellBounds = useMemo(() => getCellBounds(activeConfig), [activeConfig])
-  const selectedCellKey = selectedCell
-    ? toCellKey(selectedCell.row, selectedCell.column)
+  const selectedCellKey = effectiveSelectedCell
+    ? toCellKey(effectiveSelectedCell.row, effectiveSelectedCell.column)
     : null
   const selectedCellName = selectedCellKey
     ? activeConfig.cellNames[selectedCellKey] ?? ''
     : ''
 
-  const sanitizeConfig = useCallback(
-    (
-      rawConfig: {
-        columns?: unknown
-        rows?: unknown
-        horizontalLines?: unknown
-        verticalLines?: unknown
-        cellNames?: unknown
-        dimensions?: { width?: unknown; height?: unknown } | null
-      },
-      fallback: ImageGridConfig,
-    ): ImageGridConfig => {
-      const columns = Math.max(
-        1,
-        Math.min(30, Number(rawConfig.columns) || fallback.columns),
-      )
-      const rows = Math.max(1, Math.min(30, Number(rawConfig.rows) || fallback.rows))
-
-      const width = Number(rawConfig.dimensions?.width)
-      const height = Number(rawConfig.dimensions?.height)
-      const nextCellNames: Record<string, string> = {}
-
-      if (rawConfig.cellNames && typeof rawConfig.cellNames === 'object') {
-        for (const [key, value] of Object.entries(rawConfig.cellNames)) {
-          const parsed = parseCellKey(key)
-          if (!parsed) {
-            continue
-          }
-          if (parsed.row >= rows || parsed.column >= columns) {
-            continue
-          }
-          if (typeof value !== 'string') {
-            continue
-          }
-          const trimmed = value.trim()
-          if (!trimmed) {
-            continue
-          }
-          nextCellNames[key] = trimmed
-        }
-      }
-
-      return {
-        columns,
-        rows,
-        horizontalLines: normalizeStops(rawConfig.horizontalLines, rows),
-        verticalLines: normalizeStops(rawConfig.verticalLines, columns),
-        cellNames: nextCellNames,
-        dimensions:
-          Number.isFinite(width) && Number.isFinite(height)
-            ? { width, height }
-            : fallback.dimensions,
-      }
-    },
-    [],
-  )
-
-  const updateConfig = useCallback(
-    (imageId: string, updater: (previous: ImageGridConfig) => ImageGridConfig) => {
-      setConfigs((previous) => {
-        const current = previous[imageId] ?? createDefaultConfig()
-        return {
-          ...previous,
-          [imageId]: updater(current),
-        }
-      })
-    },
-    [],
-  )
-
   useEffect(() => {
-    try {
-      const serialized = localStorage.getItem(STORAGE_KEY)
-      if (!serialized) {
-        setIsHydrated(true)
-        return
-      }
+    let mounted = true
 
-      const parsed = JSON.parse(serialized) as PersistedState
-      const knownImageIds = new Set(images.map((image) => image.id))
-      const rawConfigs = parsed?.configs ?? {}
-      const hydratedConfigs: Record<string, ImageGridConfig> = {}
+    const hydrate = async () => {
+      try {
+        const [storedSheets, storedActiveSheetId] = await Promise.all([
+          listSheets(),
+          getActiveSheetId(),
+        ])
 
-      for (const [imageId, rawConfig] of Object.entries(rawConfigs)) {
-        if (!knownImageIds.has(imageId) || !rawConfig) {
-          continue
+        if (!mounted) {
+          return
         }
 
-        hydratedConfigs[imageId] = sanitizeConfig(rawConfig, createDefaultConfig())
-      }
+        setSheets(storedSheets)
 
-      setConfigs(hydratedConfigs)
-
-      const persistedActive = parsed?.activeImageId
-      if (persistedActive && knownImageIds.has(persistedActive)) {
-        setActiveImageId(persistedActive)
+        if (
+          storedActiveSheetId &&
+          storedSheets.some((sheet) => sheet.id === storedActiveSheetId)
+        ) {
+          setActiveSheetIdState(storedActiveSheetId)
+        } else {
+          setActiveSheetIdState(storedSheets[0]?.id ?? null)
+        }
+      } catch {
+        if (mounted) {
+          setInfoMessage('Could not load browser storage. You can still upload new files.')
+        }
+      } finally {
+        if (mounted) {
+          setIsHydrated(true)
+        }
       }
-    } catch {
-      setImportMessage('Local state could not be restored. Starting with defaults.')
-    } finally {
-      setIsHydrated(true)
     }
-  }, [images, sanitizeConfig])
+
+    void hydrate()
+
+    return () => {
+      mounted = false
+    }
+  }, [])
 
   useEffect(() => {
     if (!isHydrated) {
       return
     }
-
-    try {
-      const payload = {
-        activeImageId,
-        configs,
-      }
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
-    } catch {
-      setImportMessage('Local save failed. Check browser storage availability.')
-    }
-  }, [activeImageId, configs, isHydrated])
+    void setActiveSheetId(activeSheetId)
+  }, [activeSheetId, isHydrated])
 
   useEffect(() => {
-    if (!dragState || !activeImageId) {
+    if (!isHydrated) {
+      return
+    }
+    if (dirtySheetIdsRef.current.size === 0) {
+      return
+    }
+
+    const sheetById = new Map(sheets.map((sheet) => [sheet.id, sheet]))
+    const dirtyIds = [...dirtySheetIdsRef.current]
+    dirtySheetIdsRef.current.clear()
+
+    void Promise.all(
+      dirtyIds.map((id) => {
+        const sheet = sheetById.get(id)
+        if (!sheet) {
+          return Promise.resolve()
+        }
+        return putSheetMeta(toSheetMeta(sheet))
+      }),
+    ).catch(() => {
+      setInfoMessage('Some changes were not persisted to browser storage.')
+    })
+  }, [sheets, isHydrated])
+
+  useEffect(() => {
+    if (!dragState || !activeSheetId) {
       return
     }
 
@@ -390,17 +382,34 @@ function App() {
           ? (event.clientX - bounds.left) / bounds.width
           : (event.clientY - bounds.top) / bounds.height
 
-      updateConfig(activeImageId, (previous) => {
-        const key =
-          dragState.axis === 'vertical' ? 'verticalLines' : 'horizontalLines'
-        const next = [...previous[key]]
-        next[dragState.index] = clampLineValue(progress, next, dragState.index)
+      setSheets((previous) =>
+        previous.map((sheet) => {
+          if (sheet.id !== activeSheetId) {
+            return sheet
+          }
 
-        return {
-          ...previous,
-          [key]: next,
-        }
-      })
+          const key =
+            dragState.axis === 'vertical' ? 'verticalLines' : 'horizontalLines'
+          const nextLines = [...sheet.grid[key]]
+          nextLines[dragState.index] = clampLineValue(
+            progress,
+            nextLines,
+            dragState.index,
+          )
+
+          const nextSheet: SheetRecord = {
+            ...sheet,
+            updatedAt: Date.now(),
+            grid: {
+              ...sheet.grid,
+              [key]: nextLines,
+            },
+          }
+
+          dirtySheetIdsRef.current.add(nextSheet.id)
+          return nextSheet
+        }),
+      )
     }
 
     const onPointerUp = () => {
@@ -414,27 +423,10 @@ function App() {
       window.removeEventListener('pointermove', onPointerMove)
       window.removeEventListener('pointerup', onPointerUp)
     }
-  }, [activeImageId, dragState, updateConfig])
-
-  useEffect(() => {
-    setSelectedCell(null)
-  }, [activeImageId])
-
-  useEffect(() => {
-    if (!selectedCell) {
-      return
-    }
-
-    if (
-      selectedCell.row >= activeConfig.rows ||
-      selectedCell.column >= activeConfig.columns
-    ) {
-      setSelectedCell(null)
-    }
-  }, [activeConfig.columns, activeConfig.rows, selectedCell])
+  }, [activeSheetId, dragState])
 
   useLayoutEffect(() => {
-    if (!selectedCell) {
+    if (!effectiveSelectedCell) {
       return
     }
 
@@ -446,180 +438,202 @@ function App() {
     return () => {
       window.cancelAnimationFrame(rafId)
     }
-  }, [selectedCell])
+  }, [effectiveSelectedCell])
 
-  const handleRowsChange = (rows: number) => {
-    if (!activeImageId) {
-      return
-    }
+  const updateActiveSheet = useCallback(
+    (updater: (current: SheetRecord) => SheetRecord) => {
+      if (!activeSheetId) {
+        return
+      }
 
-    updateConfig(activeImageId, (previous) => ({
-      ...sanitizeConfig(
-        {
-          ...previous,
-          rows,
-          horizontalLines: createUniformStops(rows),
-          verticalLines: previous.verticalLines,
-          cellNames: previous.cellNames,
-          dimensions: previous.dimensions,
-        },
-        previous,
-      ),
-    }))
-  }
+      setSheets((previous) =>
+        previous.map((sheet) => {
+          if (sheet.id !== activeSheetId) {
+            return sheet
+          }
+          const nextSheet = updater(sheet)
+          dirtySheetIdsRef.current.add(nextSheet.id)
+          return nextSheet
+        }),
+      )
+    },
+    [activeSheetId],
+  )
 
-  const handleColumnsChange = (columns: number) => {
-    if (!activeImageId) {
-      return
-    }
+  const handleRowsChange = useCallback(
+    (rows: number) => {
+      updateActiveSheet((sheet) => ({
+        ...sheet,
+        updatedAt: Date.now(),
+        grid: sanitizeGrid(
+          {
+            ...sheet.grid,
+            rows,
+            horizontalLines: createUniformStops(rows),
+          },
+          sheet.grid,
+        ),
+      }))
+    },
+    [updateActiveSheet],
+  )
 
-    updateConfig(activeImageId, (previous) => ({
-      ...sanitizeConfig(
-        {
-          ...previous,
-          columns,
-          verticalLines: createUniformStops(columns),
-          horizontalLines: previous.horizontalLines,
-          cellNames: previous.cellNames,
-          dimensions: previous.dimensions,
-        },
-        previous,
-      ),
-    }))
-  }
+  const handleColumnsChange = useCallback(
+    (columns: number) => {
+      updateActiveSheet((sheet) => ({
+        ...sheet,
+        updatedAt: Date.now(),
+        grid: sanitizeGrid(
+          {
+            ...sheet.grid,
+            columns,
+            verticalLines: createUniformStops(columns),
+          },
+          sheet.grid,
+        ),
+      }))
+    },
+    [updateActiveSheet],
+  )
 
-  const handleImageLoad = (imageId: string, width: number, height: number) => {
-    updateConfig(imageId, (previous) => ({
-      ...previous,
-      dimensions: { width, height },
-    }))
-  }
+  const runUploadPipeline = useCallback(async (files: File[]): Promise<UploadSummary> => {
+    let succeeded = 0
+    let failed = 0
 
-  const exportJson = () => {
-    const payload = {
-      version: '1.0',
-      exportedAt: new Date().toISOString(),
-      defaults: {
-        columns: DEFAULT_COLUMNS,
-        rows: DEFAULT_ROWS,
-      },
-      images: images.map((image) => {
-        const config = configs[image.id] ?? createDefaultConfig()
-        return {
-          id: image.id,
-          filename: image.filename,
-          dimensions: config.dimensions,
+    const tasks = files.map(async (file, index) => {
+      const now = Date.now() + index
+      const id = crypto.randomUUID()
+      const initialSheet: SheetRecord = {
+        id,
+        filename: file.name,
+        displayName: buildDisplayName(file.name),
+        createdAt: now,
+        updatedAt: now,
+        status: 'processing',
+        errorMessage: null,
+        grid: createDefaultGridConfig(),
+        originalBlob: file,
+        processedBlob: null,
+      }
+
+      setSheets((previous) => [...previous, initialSheet])
+      setActiveSheetIdState((current) => current ?? id)
+
+      await Promise.all([
+        putSheetMeta(toSheetMeta(initialSheet)),
+        putSheetBlobs(id, file, null),
+      ])
+
+      try {
+        const processed = await preprocessImage(file, WHITE_BG_THRESHOLD, (stage) => {
+          setWorkerStageBySheetId((previous) => ({ ...previous, [id]: stage }))
+        })
+
+        setSheets((previous) =>
+          previous.map((sheet) => {
+            if (sheet.id !== id) {
+              return sheet
+            }
+
+            return {
+              ...sheet,
+              updatedAt: Date.now(),
+              status: 'ready',
+              errorMessage: null,
+              processedBlob: processed.blob,
+              grid: {
+                ...sheet.grid,
+                dimensions: {
+                  width: processed.width,
+                  height: processed.height,
+                },
+              },
+            }
+          }),
+        )
+
+        const updatedMeta: SheetMeta = {
+          ...toSheetMeta(initialSheet),
+          updatedAt: Date.now(),
+          status: 'ready',
+          errorMessage: null,
           grid: {
-            columns: config.columns,
-            rows: config.rows,
-            horizontalLines: config.horizontalLines.map(round4),
-            verticalLines: config.verticalLines.map(round4),
-            cellNames: config.cellNames,
+            ...initialSheet.grid,
+            dimensions: {
+              width: processed.width,
+              height: processed.height,
+            },
           },
         }
-      }),
-    }
 
-    const blob = new Blob([JSON.stringify(payload, null, 2)], {
-      type: 'application/json',
+        await Promise.all([
+          putSheetMeta(updatedMeta),
+          putSheetBlobs(id, file, processed.blob),
+        ])
+
+        succeeded += 1
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Background removal failed'
+
+        setSheets((previous) =>
+          previous.map((sheet) => {
+            if (sheet.id !== id) {
+              return sheet
+            }
+
+            return {
+              ...sheet,
+              updatedAt: Date.now(),
+              status: 'error',
+              errorMessage: message,
+            }
+          }),
+        )
+
+        await putSheetMeta({
+          ...toSheetMeta(initialSheet),
+          updatedAt: Date.now(),
+          status: 'error',
+          errorMessage: message,
+        })
+
+        failed += 1
+      } finally {
+        setWorkerStageBySheetId((previous) => {
+          const next = { ...previous }
+          delete next[id]
+          return next
+        })
+      }
     })
-    const url = URL.createObjectURL(blob)
-    const anchor = document.createElement('a')
-    anchor.href = url
-    anchor.download = 'grid-setups.json'
-    anchor.click()
-    URL.revokeObjectURL(url)
-  }
 
-  const handleImportFile = async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0]
+    await Promise.all(tasks)
+    return { succeeded, failed }
+  }, [])
+
+  const handleUploadFiles = async (event: ChangeEvent<HTMLInputElement>) => {
+    const selectedFiles = event.target.files ? Array.from(event.target.files) : []
     event.target.value = ''
 
-    if (!file) {
+    const files = selectedFiles.filter((file) => file.type.startsWith('image/'))
+    if (files.length === 0) {
+      setInfoMessage('Please select one or more image files.')
       return
     }
 
+    setInfoMessage(`Uploading ${files.length} file(s). Background cleanup runs in a worker.`)
+
     try {
-      const jsonText = await file.text()
-      const parsed = JSON.parse(jsonText) as {
-        images?: Array<{
-          id?: unknown
-          filename?: unknown
-          dimensions?: { width?: unknown; height?: unknown } | null
-          grid?: {
-            columns?: unknown
-            rows?: unknown
-            horizontalLines?: unknown
-            verticalLines?: unknown
-            cellNames?: unknown
-          }
-        }>
+      const summary = await runUploadPipeline(files)
+      if (summary.failed === 0) {
+        setInfoMessage(`Uploaded and processed ${summary.succeeded} file(s).`)
+      } else {
+        setInfoMessage(
+          `Processed ${summary.succeeded} file(s), ${summary.failed} failed. Check sheet status for details.`,
+        )
       }
-
-      if (!Array.isArray(parsed.images)) {
-        throw new Error('Invalid file format: missing images array')
-      }
-
-      const imagesById = new Map(images.map((image) => [image.id, image]))
-      let appliedCount = 0
-
-      setConfigs((previous) => {
-        const next = { ...previous }
-
-        for (const importedImage of parsed.images ?? []) {
-          const importedId =
-            typeof importedImage.id === 'string' ? importedImage.id : null
-          const importedFilename =
-            typeof importedImage.filename === 'string'
-              ? importedImage.filename
-              : null
-          const fallbackId = importedFilename ? toImageId(importedFilename) : null
-          const targetId = imagesById.has(importedId ?? '')
-            ? importedId
-            : fallbackId && imagesById.has(fallbackId)
-              ? fallbackId
-              : null
-
-          if (!targetId) {
-            continue
-          }
-
-          const columns = Math.max(
-            1,
-            Math.min(30, Number(importedImage.grid?.columns) || DEFAULT_COLUMNS),
-          )
-          const rows = Math.max(
-            1,
-            Math.min(30, Number(importedImage.grid?.rows) || DEFAULT_ROWS),
-          )
-
-          const existing = next[targetId] ?? createDefaultConfig()
-
-          next[targetId] = sanitizeConfig(
-            {
-              columns,
-              rows,
-              horizontalLines: importedImage.grid?.horizontalLines,
-              verticalLines: importedImage.grid?.verticalLines,
-              cellNames: importedImage.grid?.cellNames,
-              dimensions: importedImage.dimensions,
-            },
-            existing,
-          )
-
-          appliedCount += 1
-        }
-
-        return next
-      })
-
-      setImportMessage(
-        appliedCount > 0
-          ? `Imported setups for ${appliedCount} image(s).`
-          : 'No matching image entries were found in this file.',
-      )
     } catch {
-      setImportMessage('Import failed. Please select a valid exported JSON file.')
+      setInfoMessage('Upload pipeline failed unexpectedly.')
     }
   }
 
@@ -630,23 +644,17 @@ function App() {
       sourceColumns: activeConfig.columns,
       cellNames: copiedNames,
     })
-    setImportMessage(
-      `Copied ${Object.keys(copiedNames).length} cell name(s) from this sheet.`,
-    )
+    setInfoMessage(`Copied ${Object.keys(copiedNames).length} cell name(s) from this sheet.`)
   }
 
   const handlePasteCellNames = () => {
-    if (!activeImageId) {
-      return
-    }
-
     if (!nameClipboard) {
-      setImportMessage('Clipboard is empty. Copy names from another sheet first.')
+      setInfoMessage('Clipboard is empty. Copy names from another sheet first.')
       return
     }
 
     let keptCount = 0
-    updateConfig(activeImageId, (previous) => {
+    updateActiveSheet((sheet) => {
       const nextNames: Record<string, string> = {}
 
       for (const [key, value] of Object.entries(nameClipboard.cellNames)) {
@@ -654,7 +662,7 @@ function App() {
         if (!parsed) {
           continue
         }
-        if (parsed.row >= previous.rows || parsed.column >= previous.columns) {
+        if (parsed.row >= sheet.grid.rows || parsed.column >= sheet.grid.columns) {
           continue
         }
 
@@ -663,19 +671,71 @@ function App() {
       }
 
       return {
-        ...previous,
-        cellNames: nextNames,
+        ...sheet,
+        updatedAt: Date.now(),
+        grid: {
+          ...sheet.grid,
+          cellNames: nextNames,
+        },
       }
     })
 
     const sourceLabel = `${nameClipboard.sourceColumns}x${nameClipboard.sourceRows}`
     const targetLabel = `${activeConfig.columns}x${activeConfig.rows}`
     if (sourceLabel === targetLabel) {
-      setImportMessage(`Pasted ${keptCount} cell name(s).`)
+      setInfoMessage(`Pasted ${keptCount} cell name(s).`)
     } else {
-      setImportMessage(
+      setInfoMessage(
         `Pasted ${keptCount} cell name(s) with size remap (${sourceLabel} -> ${targetLabel}).`,
       )
+    }
+  }
+
+  const handleDeleteActiveSheet = async () => {
+    if (!activeSheet) {
+      return
+    }
+
+    const shouldDelete = window.confirm(`Delete ${activeSheet.displayName}?`)
+    if (!shouldDelete) {
+      return
+    }
+
+    const deletedId = activeSheet.id
+    const nextActiveId =
+      activeSheetId === deletedId
+        ? sheets.find((sheet) => sheet.id !== deletedId)?.id ?? null
+        : activeSheetId
+
+    setSheets((previous) => previous.filter((sheet) => sheet.id !== deletedId))
+    setActiveSheetIdState(nextActiveId)
+    setSelectedCell(null)
+
+    try {
+      await deleteSheet(deletedId)
+      setInfoMessage('Sheet deleted.')
+    } catch {
+      setInfoMessage('Failed to delete sheet from browser storage.')
+    }
+  }
+
+  const handleExportZip = async () => {
+    const processingCount = sheets.filter((sheet) => sheet.status === 'processing').length
+    if (processingCount > 0) {
+      setInfoMessage(`Please wait: ${processingCount} sheet(s) are still processing.`)
+      return
+    }
+
+    setIsExporting(true)
+
+    try {
+      await exportSheetsAsZip(sheets)
+      setInfoMessage('ZIP exported successfully.')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'ZIP export failed.'
+      setInfoMessage(message)
+    } finally {
+      setIsExporting(false)
     }
   }
 
@@ -684,7 +744,7 @@ function App() {
       <aside className="sidebar">
         <div className="sidebar-head">
           <h1>Sprite Cutter</h1>
-          <p>Switch images, tune the grid, drag lines, export once.</p>
+          <p>Upload sheets, define cells, and export ZIP. All data stays in your browser.</p>
         </div>
 
         <label className="field" htmlFor="columns-input">
@@ -695,10 +755,9 @@ function App() {
             min={1}
             max={30}
             value={activeConfig.columns}
+            disabled={!activeSheet}
             onChange={(event) =>
-              handleColumnsChange(
-                Math.max(1, Math.min(30, Number(event.target.value) || 1)),
-              )
+              handleColumnsChange(Math.max(1, Math.min(30, Number(event.target.value) || 1)))
             }
           />
         </label>
@@ -711,17 +770,16 @@ function App() {
             min={1}
             max={30}
             value={activeConfig.rows}
+            disabled={!activeSheet}
             onChange={(event) =>
-              handleRowsChange(
-                Math.max(1, Math.min(30, Number(event.target.value) || 1)),
-              )
+              handleRowsChange(Math.max(1, Math.min(30, Number(event.target.value) || 1)))
             }
           />
         </label>
 
-        {selectedCell ? (
+        {effectiveSelectedCell && activeSheet ? (
           <label className="field" htmlFor="cell-name-input">
-            Cell Name ({selectedCell.row + 1}, {selectedCell.column + 1})
+            Cell Name ({effectiveSelectedCell.row + 1}, {effectiveSelectedCell.column + 1})
             <input
               ref={cellNameInputRef}
               id="cell-name-input"
@@ -729,15 +787,18 @@ function App() {
               value={selectedCellName}
               placeholder="Type a name for this cell"
               onChange={(event) => {
-                if (!activeImageId || !selectedCell) {
+                if (!effectiveSelectedCell) {
                   return
                 }
 
                 const nextValue = event.target.value
-                const cellKey = toCellKey(selectedCell.row, selectedCell.column)
+                const cellKey = toCellKey(
+                  effectiveSelectedCell.row,
+                  effectiveSelectedCell.column,
+                )
 
-                updateConfig(activeImageId, (previous) => {
-                  const nextNames = { ...previous.cellNames }
+                updateActiveSheet((sheet) => {
+                  const nextNames = { ...sheet.grid.cellNames }
                   if (!nextValue.trim()) {
                     delete nextNames[cellKey]
                   } else {
@@ -745,55 +806,91 @@ function App() {
                   }
 
                   return {
-                    ...previous,
-                    cellNames: nextNames,
+                    ...sheet,
+                    updatedAt: Date.now(),
+                    grid: {
+                      ...sheet.grid,
+                      cellNames: nextNames,
+                    },
                   }
                 })
               }}
             />
           </label>
         ) : (
-          <p className="cell-helper">Click any cell in the image to name it.</p>
+          <p className="cell-helper">Upload and select a sheet, then click any cell to name it.</p>
         )}
 
         <div className="button-row">
-          <button type="button" className="import-btn" onClick={handleCopyCellNames}>
-            Copy Names
-          </button>
-          <button type="button" className="import-btn" onClick={handlePasteCellNames}>
-            Paste Names
+          <button
+            type="button"
+            className="import-btn"
+            onClick={() => uploadInputRef.current?.click()}
+          >
+            Upload Sheets
           </button>
           <button
             type="button"
             className="import-btn"
-            onClick={() => importInputRef.current?.click()}
+            onClick={handleCopyCellNames}
+            disabled={!activeSheet}
           >
-            Import JSON
+            Copy Names
           </button>
-          <button type="button" className="export-btn" onClick={exportJson}>
-            Download JSON
+          <button
+            type="button"
+            className="import-btn"
+            onClick={handlePasteCellNames}
+            disabled={!activeSheet || !nameClipboard}
+          >
+            Paste Names
+          </button>
+          <button
+            type="button"
+            className="export-btn"
+            onClick={handleExportZip}
+            disabled={isExporting || sheets.length === 0}
+          >
+            {isExporting ? 'Exporting ZIP...' : 'Download ZIP'}
+          </button>
+          <button
+            type="button"
+            className="danger-btn"
+            onClick={handleDeleteActiveSheet}
+            disabled={!activeSheet}
+          >
+            Remove Sheet
           </button>
         </div>
+
         <input
-          ref={importInputRef}
+          ref={uploadInputRef}
           type="file"
-          accept="application/json,.json"
+          accept="image/png,image/*"
           className="file-input"
-          onChange={handleImportFile}
+          multiple
+          onChange={handleUploadFiles}
         />
-        {importMessage ? <p className="import-message">{importMessage}</p> : null}
+
+        {infoMessage ? <p className="import-message">{infoMessage}</p> : null}
 
         <ul className="image-list">
-          {images.map((image) => {
-            const isActive = image.id === activeImageId
+          {sheets.map((sheet) => {
+            const isActive = sheet.id === activeSheetId
+            const stage = workerStageBySheetId[sheet.id]
             return (
-              <li key={image.id}>
+              <li key={sheet.id}>
                 <button
                   type="button"
                   className={`image-tab ${isActive ? 'active' : ''}`}
-                  onClick={() => setActiveImageId(image.id)}
+                  onClick={() => {
+                    setSelectedCell(null)
+                    setActiveSheetIdState(sheet.id)
+                  }}
                 >
-                  {image.displayName}
+                  <span>{sheet.displayName}</span>
+                  <span className={`status-pill ${sheet.status}`}>{statusLabel(sheet.status)}</span>
+                  {stage ? <small>{stageLabel(stage)}</small> : null}
                 </button>
               </li>
             )
@@ -802,30 +899,42 @@ function App() {
       </aside>
 
       <main className="editor">
-        {!activeImage ? (
-          <div className="empty">No PNG files found in the images folder.</div>
+        {!activeSheet || !activeImageUrl ? (
+          <div className="empty">No sheet selected. Upload PNG files to start.</div>
         ) : (
           <>
             <header className="editor-head">
-              <h2>{activeImage.displayName}</h2>
+              <h2>{activeSheet.displayName}</h2>
               <p>
                 {activeConfig.columns} x {activeConfig.rows} cells |{' '}
                 {activeConfig.verticalLines.length} vertical and{' '}
                 {activeConfig.horizontalLines.length} horizontal cut lines
               </p>
+              {activeSheet.status === 'error' && activeSheet.errorMessage ? (
+                <p className="sheet-error">{activeSheet.errorMessage}</p>
+              ) : null}
             </header>
 
             <div className="canvas-wrap" data-grid-canvas="true">
               <img
-                src={activeImage.src}
-                alt={activeImage.displayName}
+                src={activeImageUrl}
+                alt={activeSheet.displayName}
                 className="sheet-image"
                 onLoad={(event) => {
-                  handleImageLoad(
-                    activeImage.id,
-                    event.currentTarget.naturalWidth,
-                    event.currentTarget.naturalHeight,
-                  )
+                  const width = event.currentTarget.naturalWidth
+                  const height = event.currentTarget.naturalHeight
+                  if (activeSheet.grid.dimensions?.width === width && activeSheet.grid.dimensions?.height === height) {
+                    return
+                  }
+
+                  updateActiveSheet((sheet) => ({
+                    ...sheet,
+                    updatedAt: Date.now(),
+                    grid: {
+                      ...sheet.grid,
+                      dimensions: { width, height },
+                    },
+                  }))
                 }}
               />
 
@@ -853,9 +962,7 @@ function App() {
                     }}
                     title={`Cell ${cell.row + 1}, ${cell.column + 1}`}
                   >
-                    <span className="cell-label">
-                      {activeConfig.cellNames[cell.key] ?? ''}
-                    </span>
+                    <span className="cell-label">{activeConfig.cellNames[cell.key] ?? ''}</span>
                   </button>
                 ))}
 
@@ -863,9 +970,7 @@ function App() {
                   <div
                     key={`v-${index}`}
                     className={`grid-line vertical ${
-                      dragState?.axis === 'vertical' && dragState.index === index
-                        ? 'dragging'
-                        : ''
+                      dragState?.axis === 'vertical' && dragState.index === index ? 'dragging' : ''
                     }`}
                     style={{ left: `${value * 100}%` }}
                     onPointerDown={(event) => {
@@ -879,9 +984,7 @@ function App() {
                   <div
                     key={`h-${index}`}
                     className={`grid-line horizontal ${
-                      dragState?.axis === 'horizontal' && dragState.index === index
-                        ? 'dragging'
-                        : ''
+                      dragState?.axis === 'horizontal' && dragState.index === index ? 'dragging' : ''
                     }`}
                     style={{ top: `${value * 100}%` }}
                     onPointerDown={(event) => {
@@ -896,8 +999,7 @@ function App() {
             <footer className="editor-foot">
               {activeConfig.dimensions ? (
                 <span>
-                  Source size: {activeConfig.dimensions.width} x{' '}
-                  {activeConfig.dimensions.height}
+                  Source size: {activeConfig.dimensions.width} x {activeConfig.dimensions.height}
                 </span>
               ) : (
                 <span>Loading dimensions...</span>
@@ -906,15 +1008,14 @@ function App() {
                 type="button"
                 className="reset-btn"
                 onClick={() => {
-                  if (!activeImageId) {
-                    return
-                  }
-
-                  updateConfig(activeImageId, (previous) => ({
-                    ...previous,
-                    horizontalLines: createUniformStops(previous.rows),
-                    verticalLines: createUniformStops(previous.columns),
-                    cellNames: previous.cellNames,
+                  updateActiveSheet((sheet) => ({
+                    ...sheet,
+                    updatedAt: Date.now(),
+                    grid: {
+                      ...sheet.grid,
+                      horizontalLines: createUniformStops(sheet.grid.rows),
+                      verticalLines: createUniformStops(sheet.grid.columns),
+                    },
                   }))
                 }}
               >
