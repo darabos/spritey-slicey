@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type DragEvent,
 } from 'react'
 import './App.css'
 import {
@@ -321,6 +322,7 @@ function App() {
   const [nameClipboard, setNameClipboard] = useState<CellNamesClipboard | null>(null)
   const [isHydrated, setIsHydrated] = useState(false)
   const [isExporting, setIsExporting] = useState(false)
+  const [isFileDragActive, setIsFileDragActive] = useState(false)
   const [isExportScalingEnabled, setIsExportScalingEnabled] = useState(() =>
     loadExportScaleEnabled(),
   )
@@ -339,6 +341,7 @@ function App() {
   const dirtySheetIdsRef = useRef<Set<string>>(new Set())
   const processingVersionBySheetIdRef = useRef<Record<string, number>>({})
   const thresholdDebounceTimerBySheetIdRef = useRef<Record<string, number>>({})
+  const fileDragDepthRef = useRef(0)
 
   const activeSheet = useMemo(
     () => sheets.find((sheet) => sheet.id === activeSheetId) ?? null,
@@ -801,10 +804,7 @@ function App() {
     thresholdDebounceTimerBySheetIdRef.current[sheetId] = timerId
   }
 
-  const handleUploadFiles = async (event: ChangeEvent<HTMLInputElement>) => {
-    const selectedFiles = event.target.files ? Array.from(event.target.files) : []
-    event.target.value = ''
-
+  const handleUploadBatch = useCallback(async (selectedFiles: File[]) => {
     const files = selectedFiles.filter((file) => file.type.startsWith('image/'))
     if (files.length === 0) {
       setInfoMessage('Please select one or more image files.')
@@ -831,6 +831,48 @@ function App() {
     } catch {
       setInfoMessage('Upload pipeline failed unexpectedly.')
     }
+  }, [activeSheet, runUploadPipeline, thresholdBySheetId])
+
+  const handleUploadFiles = async (event: ChangeEvent<HTMLInputElement>) => {
+    const selectedFiles = event.target.files ? Array.from(event.target.files) : []
+    event.target.value = ''
+    await handleUploadBatch(selectedFiles)
+  }
+
+  const handleFileDragEnter = (event: DragEvent<HTMLDivElement>) => {
+    if (!Array.from(event.dataTransfer.items).some((item) => item.kind === 'file')) {
+      return
+    }
+
+    event.preventDefault()
+    fileDragDepthRef.current += 1
+    setIsFileDragActive(true)
+  }
+
+  const handleFileDragOver = (event: DragEvent<HTMLDivElement>) => {
+    if (!Array.from(event.dataTransfer.items).some((item) => item.kind === 'file')) {
+      return
+    }
+
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'copy'
+  }
+
+  const handleFileDragLeave = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    fileDragDepthRef.current = Math.max(0, fileDragDepthRef.current - 1)
+    if (fileDragDepthRef.current === 0) {
+      setIsFileDragActive(false)
+    }
+  }
+
+  const handleFileDrop = async (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    fileDragDepthRef.current = 0
+    setIsFileDragActive(false)
+
+    const droppedFiles = Array.from(event.dataTransfer.files)
+    await handleUploadBatch(droppedFiles)
   }
 
   const handleCopyCellNames = () => {
@@ -950,7 +992,14 @@ function App() {
   }
 
   return (
-    <div className="layout">
+    <div
+      className={`layout ${isFileDragActive ? 'drag-active' : ''}`}
+      onDragEnter={handleFileDragEnter}
+      onDragOver={handleFileDragOver}
+      onDragLeave={handleFileDragLeave}
+      onDrop={handleFileDrop}
+    >
+      {isFileDragActive ? <div className="drop-hint">Drop image files to upload sheets</div> : null}
       <aside className="sidebar">
         <div className="sidebar-head">
           <h1>Spritey Slicey</h1>
